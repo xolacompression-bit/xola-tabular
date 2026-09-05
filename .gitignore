@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.so
+*.dll
+*.dylib
+_tmp.parquet
+_tmp.orc
+_tmp_back.csv
+dist/
+build/
+*.spec
