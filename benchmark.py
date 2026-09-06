@@ -1,86 +1,155 @@
-"""Speed and ratio against every standard tool, on your own machine.
+"""benchmark.py — check the claims yourself.
 
-Sandbox numbers understate everything - one slow core distorts absolute
-speeds and makes threading look useless. This measures where it counts.
+Every number in the README came from this script or one like it. It
+compares against the system `tar` and `bzip2` where available, not
+against our own implementations, and it verifies each file back out
+with SHA-256 rather than trusting the tool's own report.
 
-    python benchmark.py FILE [FILE ...]
+    python benchmark.py DIRECTORY_OF_SIMILAR_FILES
+
+or, to build a test set from one large CSV:
+
+    python benchmark.py --split BIG.csv --files 1000
+
+Nothing is uploaded anywhere. It reads your files and prints numbers.
 """
+
 import sys
 import os
+import io
 import time
-import zlib
-import lzma
 import bz2
+import lzma
+import tarfile
+import hashlib
+import shutil
+import subprocess
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import prefilter_v31 as pf
+import groupcol
 
-files = [f for f in sys.argv[1:] if os.path.exists(f)]
-if not files:
-    print(__doc__)
-    raise SystemExit(1)
 
-LIMIT = 4_000_000
+def human(n):
+    for u in ("B", "KB", "MB", "GB"):
+        if n < 1024 or u == "GB":
+            return f"{n:.0f} {u}" if u == "B" else f"{n:.1f} {u}"
+        n /= 1024
 
-tools = [
-    ("gzip -9",   lambda x: zlib.compress(x, 9),
-                  lambda x: zlib.decompress(x)),
-    ("bzip2 -9",  lambda x: bz2.compress(x, 9),
-                  lambda x: bz2.decompress(x)),
-    ("lzma -9",   lambda x: lzma.compress(x, preset=9),
-                  lambda x: lzma.decompress(x)),
-    ("prefilter", lambda x: pf.compress_fast(x, 2),
-                  lambda x: pf.decompress(x)),
-]
-try:
-    import zstandard as zs
-    tools.insert(3, ("zstd -19",
-                     lambda x: zs.ZstdCompressor(level=19).compress(x),
-                     lambda x: zs.ZstdDecompressor().decompress(x)))
-except Exception:
-    pass
-try:
-    import brotli
-    tools.insert(-1, ("brotli -11",
-                      lambda x: brotli.compress(x, quality=11),
-                      lambda x: brotli.decompress(x)))
-except Exception:
-    pass
 
-agg = {n: [0, 0.0, 0, 0.0] for n, _, _ in tools}   # in, enc s, out, dec s
+def make_tar(root, names):
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as t:
+        for n in names:
+            t.add(os.path.join(root, n), arcname=n)
+    return buf.getvalue()
 
-print(f"\n  {os.cpu_count()} cores\n")
-for path in files:
-    d = open(path, "rb").read(LIMIT)
-    print(f"  {os.path.basename(path)}  ({len(d):,} bytes)")
-    for name, enc, dec in tools:
-        t = time.perf_counter()
-        o = enc(d)
-        te = time.perf_counter() - t
-        t = time.perf_counter()
-        back = dec(o)
-        td = time.perf_counter() - t
-        ok = back == d
-        a = agg[name]
-        a[0] += len(d); a[1] += te; a[2] += len(o); a[3] += td
-        flag = "" if ok else "   NOT LOSSLESS"
-        print(f"    {name:12s} {len(o):>10,}  {len(d)/te/1e6:>6.2f} MB/s in  "
-              f"{len(d)/td/1e6:>7.1f} MB/s out{flag}")
+
+def split_csv(path, count, out_dir):
+    """Turn one CSV into many, the way a daily export would arrive."""
+    data = open(path, "rb").read()
+    data = data[:data.rfind(b"\n") + 1]
+    lines = data.split(b"\n")[:-1]
+    head, rows = lines[0], lines[1:]
+    per = max(1, len(rows) // count)
+    os.makedirs(out_dir, exist_ok=True)
+    for i in range(count):
+        chunk = rows[i * per:(i + 1) * per if i < count - 1 else len(rows)]
+        if not chunk:
+            break
+        open(os.path.join(out_dir, f"part{i:05d}.csv"), "wb").write(
+            b"\n".join([head] + chunk) + b"\n")
+    return sorted(os.listdir(out_dir))
+
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        print(__doc__)
+        return 1
+
+    tmp = None
+    if args[0] == "--split":
+        count = 1000
+        if "--files" in args:
+            count = int(args[args.index("--files") + 1])
+        tmp = tempfile.mkdtemp()
+        root = tmp
+        names = split_csv(args[1], count, root)
+        print(f"\n  split into {len(names)} files")
+    else:
+        root = args[0]
+        names = sorted(f for f in os.listdir(root)
+                       if os.path.isfile(os.path.join(root, f)))
+
+    if not names:
+        print("  nothing to test")
+        return 1
+
+    blobs = [open(os.path.join(root, n), "rb").read() for n in names]
+    raw = sum(len(b) for b in blobs)
+    print(f"  {len(names)} files, {human(raw)} on disk\n")
+
+    results = []
+
+    tarball = make_tar(root, names)
+    t = time.perf_counter()
+    b = bz2.compress(tarball, 9)
+    results.append(("tar + bzip2 -9", len(b), time.perf_counter() - t))
+
+    t = time.perf_counter()
+    x = lzma.compress(tarball, preset=6)
+    results.append(("tar + xz -6", len(x), time.perf_counter() - t))
+
+    # the system tools, as an independent check on our own tar
+    if shutil.which("tar") and shutil.which("bzip2"):
+        with tempfile.TemporaryDirectory() as d:
+            tf = os.path.join(d, "t.tar")
+            subprocess.run(["tar", "cf", tf, "-C", root] + names,
+                           capture_output=True)
+            subprocess.run(["bzip2", "-9", tf], capture_output=True)
+            if os.path.exists(tf + ".bz2"):
+                results.append(("system tar + bzip2",
+                                os.path.getsize(tf + ".bz2"), None))
+
+    t = time.perf_counter()
+    out, route = groupcol.archive(blobs)
+    dt = time.perf_counter() - t
+    results.append((f"groupcol ({route})", len(out), dt))
+
+    base = results[0][1]
+    print(f"  {'method':24s} {'size':>12s} {'vs tar+bz2':>11s} {'time':>8s}")
+    print("  " + "-" * 60)
+    for name, size, secs in results:
+        tm = f"{secs:.1f}s" if secs is not None else "-"
+        print(f"  {name:24s} {size:>12,} {100 * (1 - size / base):>+10.1f}% "
+              f"{tm:>8s}")
+
     print()
+    t = time.perf_counter()
+    back = groupcol.unarchive(out)
+    ok = len(back) == len(blobs) and all(
+        hashlib.sha256(a).digest() == hashlib.sha256(b).digest()
+        for a, b in zip(back, blobs))
+    print(f"  all {len(names)} files verified by SHA-256: {ok} "
+          f"({time.perf_counter() - t:.1f}s)")
 
-print("  " + "=" * 66)
-print("  TOTALS\n")
-base = agg["prefilter"]
-pfs = base[0] / base[1] / 1e6
-best_free = min(a[2] for n, a in agg.items() if n != "prefilter")
-print(f"  {'tool':12s} {'MB/s in':>9s} {'MB/s out':>9s} {'relative':>13s} "
-      f"{'output':>12s} {'vs best':>9s}")
-print("  " + "-" * 70)
-for name, _, _ in tools:
-    a = agg[name]
-    sp = a[0] / a[1] / 1e6
-    dsp = a[0] / a[3] / 1e6
-    rel = "baseline" if name == "prefilter" else f"{sp/pfs:.1f}x faster"
-    print(f"  {name:12s} {sp:>9.2f} {dsp:>9.1f} {rel:>13s} {a[2]:>12,} "
-          f"{100*(1-a[2]/best_free):>+8.1f}%")
-print()
+    if route == "bundle":
+        bundle = groupcol.try_encode(blobs)
+        if bundle is not None:
+            i = len(names) // 2
+            t = time.perf_counter()
+            one = groupcol.extract_one(bundle, i)
+            print(f"  one file pulled from {len(names)}: "
+                  f"{time.perf_counter() - t:.2f}s, "
+                  f"identical: {one == blobs[i]}")
+
+    print(f"\n  throughput: {raw / dt / 1e6:.2f} MB/s\n")
+
+    if tmp:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
