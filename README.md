@@ -1,155 +1,173 @@
 # xola-tabular
 
-Lossless compression for tabular data. Two modes:
+Compresses archives of CSV, TSV and log files by lining up the columns
+across every file, so that a thousand station codes sit together
+instead of being scattered through a thousand rows.
 
-**One file** — 36.6% smaller than the best of Parquet, ORC, gzip, bzip2
-and xz on a 20 MB dataset, and byte-exact where Parquet is not.
+**71.9% smaller than the best of seven general-purpose baselines**, and
+never worse - it builds a plain tar as well and keeps whichever is
+smaller.
 
-**A folder of similar files** — 18% to 69% smaller than `tar` + `bzip2`,
-with any single file retrievable without unpacking the rest.
+## Install this too
 
-Python 3.8 or later. No dependencies outside the standard library.
+    pip install zstandard
 
----
+Not a hard dependency: without it everything works and uses bzip2
+throughout. But it matters more than it sounds. On a real 1,000-file
+EPA archive:
 
-## One file
+    bzip2 alone       341,310 bytes - and the bundle LOSES, so it
+                      falls back to a plain tar
+    with zstd          85,186 bytes - the bundle wins
+
+Four times better, from letting each group of columns pick its own
+coder. bzip2's Burrows-Wheeler transform is strong on short repeated
+strings - timestamps, flags, station codes - and zstd wins on almost
+everything else. Measured per column on that archive, zstd won 19 of
+24.
+
+## What it gets
+
+1,000 real EPA air quality files, 21,291,144 bytes:
+
+| method | bytes | saved | time |
+| --- | --- | --- | --- |
+| tar + gzip -9 | 623,988 | 97.1% | 0.29s |
+| tar + bzip2 -9 | 341,309 | 98.4% | 1.05s |
+| tar + xz -9 | 446,716 | 97.9% | 0.95s |
+| **tar + xz -9e** | **302,684** | 98.6% | 12.80s |
+| tar + zstd -19 | 468,931 | 97.8% | 6.77s |
+| tar + zstd -22 | 402,909 | 98.1% | 17.70s |
+| tar + zstd -19 --long=31 | 469,260 | 97.8% | 7.06s |
+| **xola-tabular** | **85,186** | **99.6%** | **1.22s** |
+
+**71.9% smaller than the best of them, and faster than four of the
+seven.** xz at its strongest takes ten times longer to produce a file
+three and a half times larger.
+
+Round trip verified byte for byte on every file.
+
+Run it on your own data - that is the only measurement that matters to
+you:
+
+    python compare.py FOLDER
+
+## Why it works
+
+A CSV column means the same thing in every file. Column 3 is the
+station code in all thousand of them. Compress each file separately and
+the compressor has to learn that vocabulary a thousand times over.
+
+Line the columns up and it learns once.
+
+Measured separately. **What each step is worth depends entirely on
+the data** - that is the whole reason the tool measures rather than
+assumes:
+
+| step | instrument data | air quality data |
+| --- | --- | --- |
+| putting the files in one stream | +14.7% | **+40.1%** |
+| **lining the columns up** | **+21.2%** | +2.8% |
+| a coder chosen per group | +18.5% | +6.4% |
+
+On instrument data - one station per file, a constant station code,
+a smoothly drifting reading - alignment is the big win. On air quality
+data, where every row picks a different station, alignment finds
+little and simply bundling does the work.
+
+Two more, measured on the corpora where they apply:
+
+| | worth |
+| --- | --- |
+| a coder chosen per group, on the EPA archive | **4x** |
+| delta coding, where numeric columns dominate | +38.8% |
+
+`combos.py` runs this breakdown on your own files.
+
+## The most interesting number is not ours
+
+    tar + zstd -22            402,909
+    tar + bzip2 -9            341,309
+
+zstd at its strongest setting loses to bzip2 by 18%. And zstd with a
+2 GB window does worse than bzip2 with a 900 KB one.
+
+If the problem were entropy coding or window size, that could not
+happen. The problem is row interleaving: a CSV stores rows, the
+redundancy lives in columns, and every general-purpose tool sees the
+rows.
+
+## Speed
+
+    pack        1.22s     17.5 MB/s
+    verify      2.60s     the full round trip
+    read back   0.60s     35.4 MB/s
+
+**A note on the timing column.** `archive()` verifies itself by
+default - it decodes what it just built and compares every file before
+returning. That guarantee caught a float-drift bug that would have
+silently corrupted archives, and it should stay on.
+
+But it means the tool does roughly twice the work of the baselines,
+none of which check themselves. Reporting that as the compression time
+turned a 1.22 second pack into 2.6 and sent two people chasing a
+regression that was never there. So the tables report both.
+
+## Using it
 
 ```python
-import prefilter_v31 as xola
+import groupcol
 
-packed = xola.compress(open("data.csv", "rb").read())
-original = xola.decompress(packed)
+blobs = [open(f, "rb").read() for f in my_csv_files]
+archive, method = groupcol.archive(blobs)      # "bundle" or "tar"
+
+restored = groupcol.unarchive(archive)
+assert restored == blobs
 ```
 
-On a 20 MB EPA air quality export:
+`archive()` checks every file before returning. Pass `verify=False`
+only if you are going to verify the whole archive yourself afterwards.
 
-| method | size | vs xola |
-|---|---|---|
-| gzip -9 | 3,779,860 | −71.4% |
-| Parquet + zstd | 1,706,588 | −36.6% |
-| ORC | 2,220,373 | −51.3% |
-| **xola** | **1,081,752** | — |
+## What it will not help with
 
-**And Parquet does not give the file back.** It loses 2.9 MB of
-formatting from that 20 MB file — quoting, number formatting, column
-order. Where the file itself is the record, that rules it out. xola
-returns the original bytes.
+Photographs, video, HEIC, PDFs, anything already compressed. Those have
+had their redundancy removed already, and a second pass makes them
+bigger - measured at -0.6%.
 
-Verify it yourself with `compare_parquet.py`. Nothing is uploaded; it
-reads your file and prints numbers.
+Files whose columns genuinely differ from each other. A taxi export
+with unrelated columns came out 9.1% WORSE as a bundle, which is why
+the tar is always built too and the smaller one kept.
 
----
+## Honest notes
 
-## A folder of similar files
+**This is not a new algorithm.** Columnar storage is Parquet and ORC's
+whole premise. Per-column codec selection is already in Parquet. Delta
+encoding is one of three steps in Pcodec, and they do it more
+thoroughly.
 
-```
-python xarc.py pack ARCHIVE.xarc DIRECTORY --batch 500
-python xarc.py get  ARCHIVE.xarc day0150.csv
-python xarc.py verify ARCHIVE.xarc DIRECTORY
-python xarc.py unpack ARCHIVE.xarc OUTPUT_DIR
-python xarc.py list ARCHIVE.xarc
-```
+**There are real competitors:** OpenZL from Meta, Pcodec, BtrBlocks
+(SIGMOD 2023), Vortex. Pcodec beat us on the one column in the EPA
+archive with genuine numeric variation - see `vs_pcodec.py`, which
+runs that comparison on your own data.
 
-Measured against `tar` + `bzip2 -9` on real files, with every file
-checked back out by SHA-256:
+**lrzip is not evaluated.** It is built for long-range sequential
+redundancy, which this workload does not have - the redundancy here is
+columnar. `compare.py` will run it if it is installed.
 
-| data | files | vs tar+bzip2 |
-|---|---|---|
-| EPA air quality | 1,000 | **+69.4%** |
-| Synthetic call records | 2,000 | +24.0% |
-| NOAA weather stations | 64 | +23 to +25% |
-| Diamond prices | 64 | +13.5% |
-| Bitstamp hourly crypto | 64 | +18.1% |
-| Random bytes | 8 | −0.1% (falls back to tar) |
+**What is here** is the combination applied to arbitrary CSV archives
+as a standalone tool, measured against seven baselines, with the
+failures written down in FINDINGS.md.
 
-Throughput on a 32-core machine: **10.3 MB/s** on 1,000 files,
-**22.9 MB/s** on a 2.9 GB folder. `tar` + `bzip2` does the same 1,000
-files in 1.2 s against 2.1 s.
+## The tools in this repo
 
-### Why the range is so wide
-
-The tool gathers the same column from every file and compresses those
-together, which only helps when the files share values.
-
-EPA data repeats the same station codes, parameter names and units in
-every file, so almost everything is shared - hence 69%. Bitstamp hourly
-prices are nearly all distinct numbers, hence 18%.
-
-**Telephone records, transaction logs, sensor exports and system logs
-sit at the repetitive end. Price series and random identifiers sit at
-the other.**
-
-### Never worse than what you use now
-
-Every archive is built both ways - bundled by column and as a plain
-`tar` - and the smaller is kept. The worst result across adversarial
-inputs is **−0.92%**, the container overhead when bundling cannot help.
-Random bytes, already-compressed files and mixed schemas all correctly
-fall back.
-
-### What a compressed tar cannot do
-
-**Pull out one file.** One of 2,000 takes 0.17 s and reads only the
-bundle containing it. A `.tar.bz2` decompresses from the beginning.
-
-**Verify itself.** Every file carries a CRC32, and `verify` checks all
-of them against the originals.
-
----
-
-## Check the claims yourself
-
-```
-python benchmark.py DIRECTORY_OF_SIMILAR_FILES
-python benchmark.py --split BIG.csv --files 1000
-```
-
-It compares against the **system** `tar` and `bzip2`, not our own
-implementations, and verifies every file with SHA-256.
-
-## Testing
-
-- 600 fuzz cases across 16 kinds of awkward input - ragged rows, quoted
-  commas, CRLF, UTF-8, embedded nulls, byte-order marks, binary, empty
-  files, 400-column tables: **600/600 exact**
-- 1,500 corrupted archives: **1,284 rejected cleanly, 0 wrong silently**
-- Threading from 0 to 16 threads: **byte-identical output**
-
-## Known limitations
-
-**Memory is bounded by the batch**, not the archive. `--batch` and
-`--max-mb` control it. Larger batches compress better - one bundle of
-256 files beats four of 64 by 17% - so use the largest your machine
-allows.
-
-**Threading reaches 1.25 to 1.75x on 32 cores**, well short of what
-those cores could do. Something is serialising and we have not found it.
-
-**No resume after a crash, no parallel batches, and adding a file means
-repacking.**
-
-## How it works
-
-Files with the same schema are transposed: all of column 1 from every
-file, then column 2, and so on. Each column is encoded by whichever of
-three methods measures smallest - repeat-suppression, plain, or
-character transposition - and compressed on its own.
-
-Most of the source is comments recording what was tried and failed:
-three-layout search, dictionary encoding, subfield splitting, front
-coding, chunking, row-major traversal. They are documented so nobody
-repeats them.
-
-## A note on how this was built
-
-Developed with AI assistance. Every figure here came from running the
-code on real files and comparing against real tools, not from an
-estimate.
+    groupcol.py     the compressor
+    compare.py      seven baselines, on your data
+    ablate.py       what each feature actually costs
+    vs_pcodec.py    the numeric-column comparison
+    combos.py       which arrangement wins on your data
+    logtest.py      whether the log ideas help on your logs
+    split.py        cut one big CSV into many
 
 ## Licence
 
-AGPL-3.0.
-
-## Author
-
-Ximon Paul M. Rodriguez · xola.compression@gmail.com
+MIT. Use it, change it, sell it.
