@@ -147,6 +147,10 @@ def main():
     dtv = time.perf_counter() - t0
     print(f"  {'xola-tabular':28s} {len(blob):>12,} "
           f"{100 * (1 - len(blob) / orig):>+7.1f}% {dt:>6.2f}s   ({method})")
+    if method != "bundle":
+        print(f"  {'':28s} the bundle LOST on this corpus - the number")
+        print(f"  {'':28s} above is a plain tar, and this tool added")
+        print(f"  {'':28s} nothing. See FINDINGS.md for when that happens.")
     print(f"  {'  and again, self-verified':28s} {'':>12s} {'':>8s} "
           f"{dtv:>6.2f}s   (a feature, not overhead)")
 

@@ -10,21 +10,61 @@ smaller.
 
 ## Install this too
 
-    pip install zstandard
+    pip install zstandard brotli
 
-Not a hard dependency: without it everything works and uses bzip2
-throughout. But it matters more than it sounds. On a real 1,000-file
+Neither is a hard dependency: without them everything works and uses
+bzip2 throughout. But it matters more than it sounds. On a real 1,000-file
 EPA archive:
 
     bzip2 alone       341,310 bytes - and the bundle LOSES, so it
                       falls back to a plain tar
-    with zstd          85,186 bytes - the bundle wins
+    with zstd          84,932 bytes - the bundle wins
 
 Four times better, from letting each group of columns pick its own
 coder. bzip2's Burrows-Wheeler transform is strong on short repeated
 strings - timestamps, flags, station codes - and zstd wins on almost
 everything else. Measured per column on that archive, zstd won 19 of
 24.
+
+## Against Parquet
+
+Parquet is the comparison that matters. It is columnar by design, it
+codes each column separately, it dictionary-encodes strings and
+delta-encodes integers - everything this tool does, from a format
+every data lake already uses.
+
+Same 1,000 EPA files, every column read as text so both formats carry
+the same information and both can return the original file:
+
+| | bytes | saved |
+| --- | --- | --- |
+| parquet + snappy | 133,993 | 99.4% |
+| parquet + zstd | 113,382 | 99.5% |
+| parquet + gzip | 111,919 | 99.5% |
+| **parquet + brotli** | **110,022** | **99.5%** |
+| **xola-tabular** | **84,932** | **99.6%** |
+
+**22.8% smaller than the best Parquet.**
+
+Two honest things next to that number.
+
+**Parquet is more than ten times faster** - 0.09s against 1.48s. A buyer who
+does not care about the last 22% should use Parquet, and most do not.
+
+**And Parquet's TYPED mode could not read this archive at all.**
+
+    ArrowTypeError: Field Qualifier has incompatible types:
+                    int64 vs string
+
+The Qualifier column is empty in most of the thousand files, so Arrow
+infers int64, and holds text in a few, so those infer as string. A
+thousand schemas that will not merge. That is not Parquet being bad -
+it is what happens when a format storing typed values meets a decade
+of CSVs written by software that did not agree with itself. But it is
+an operational cost the columnar pitch does not mention, and it
+appeared on the first real archive tried.
+
+`vs_parquet.py` runs this on your own data.
 
 ## What it gets
 
@@ -39,7 +79,7 @@ everything else. Measured per column on that archive, zstd won 19 of
 | tar + zstd -19 | 468,931 | 97.8% | 6.77s |
 | tar + zstd -22 | 402,909 | 98.1% | 17.70s |
 | tar + zstd -19 --long=31 | 469,260 | 97.8% | 7.06s |
-| **xola-tabular** | **85,186** | **99.6%** | **1.22s** |
+| **xola-tabular** | **84,932** | **99.6%** | **1.48s** |
 
 **71.9% smaller than the best of them, and faster than four of the
 seven.** xz at its strongest takes ten times longer to produce a file
@@ -99,7 +139,7 @@ rows.
 
 ## Speed
 
-    pack        1.22s     17.5 MB/s
+    pack        1.48s     14.4 MB/s
     verify      2.60s     the full round trip
     read back   0.60s     35.4 MB/s
 
@@ -110,7 +150,7 @@ silently corrupted archives, and it should stay on.
 
 But it means the tool does roughly twice the work of the baselines,
 none of which check themselves. Reporting that as the compression time
-turned a 1.22 second pack into 2.6 and sent two people chasing a
+turned a 1.48 second pack into 2.6 and sent two people chasing a
 regression that was never there. So the tables report both.
 
 ## Using it
@@ -161,12 +201,17 @@ failures written down in FINDINGS.md.
 ## The tools in this repo
 
     groupcol.py     the compressor
-    compare.py      seven baselines, on your data
+    compare.py      seven general-purpose baselines, on your data
+    vs_parquet.py   against Parquet, which is the one that matters
+    vs_pcodec.py    against Pcodec, on the numeric columns
     ablate.py       what each feature actually costs
-    vs_pcodec.py    the numeric-column comparison
+    qtest.py        which brotli quality is worth its time
     combos.py       which arrangement wins on your data
     logtest.py      whether the log ideas help on your logs
     split.py        cut one big CSV into many
+
+Every one of them runs on your own files. That is the point - none of
+the numbers in this README need to be taken on trust.
 
 ## Licence
 

@@ -116,7 +116,7 @@ but what it earns is not evenly spread:
 | air quality | value | small |
 | EPA archive_test | POC, Latitude, Longitude, MDL | **nothing measurable** |
 
-On the EPA archive the total is 85,186 bytes with delta and 85,186
+On the EPA archive the total is 84,932 bytes with delta and 84,932
 without. It fires four times and pays nothing, because those four
 columns were already cheap.
 
@@ -164,3 +164,139 @@ Compressing something twice. Every attempt lost:
 
 The gain comes from choosing the right coder for each PART, never from
 running two coders over the same part.
+
+## Does the margin survive scale?
+
+The obvious objection to a 21 MB benchmark is that 21 MB is small
+enough to be cache-resident, that LZMA's dictionary is oversized for
+it, and that cross-file redundancy is artificially dense. If the
+advantage comes from that, it should collapse on a larger corpus.
+
+Tested on a corpus built to DIVERSIFY as it grows - 2,000 stations,
+400 method codes, so vocabularies spread out rather than repeating:
+
+| corpus | bytes | best baseline | ours | margin |
+| --- | --- | --- | --- | --- |
+| 1 MB | 1,001,067 | 131,934 | 92,378 | **+30.0%** |
+| 5 MB | 5,004,900 | 653,644 | 451,249 | **+31.0%** |
+| 20 MB | 20,020,239 | 2,615,112 | 1,794,003 | **+31.4%** |
+
+**Twenty times the data and the margin grows slightly**, from 30.0% to
+31.4%. It bundles at every scale rather than falling back.
+
+Note the number is 31%, not the 71.9% from the EPA archive. **The
+margin is corpus-dependent, not scale-dependent.** This corpus was
+built with 2,000 distinct stations; the EPA archive has far more
+repetition and gives far more.
+
+## Is xz being timed unfairly?
+
+`xz -9e` is reported single-threaded, which looks like choosing the
+slowest configuration for the one baseline that competes on ratio.
+
+Measured on the 20 MB corpus:
+
+| | bytes | time |
+| --- | --- | --- |
+| xz -9e, single thread | 3,327,984 | 15.62s |
+| xz -9e -T4 | 3,327,992 | 14.69s |
+| xz -9e -T8 | 3,327,992 | 14.99s |
+| ours | 1,794,003 | 7.24s |
+
+Four threads saved nine tenths of a second. At `-9e` the dictionary is
+large enough that the stream cannot be split into enough independent
+blocks to parallelise, so threads change neither the ratio nor
+meaningfully the time.
+
+The comparison stands, and the tables say single-threaded.
+
+## When the bundle loses
+
+The tool builds a plain tar as well and keeps whichever is smaller.
+That is the never-worse guarantee, and it means a headline number can
+conceal a silent fallback - "84,932 bytes" could mean "the bundle lost
+and this is xz with extra steps."
+
+So `compare.py` now says which happened. When the method is `tar`, it
+prints that the bundle lost and that the tool added nothing.
+
+Known cases where it falls back:
+
+    a taxi export with unrelated columns          9.1% WORSE as a bundle
+    random bytes                                  falls back, as it must
+    the EPA archive WITHOUT zstd installed        falls back - and this
+                                                  is why zstd matters
+
+## Against Parquet, and what it cost to find out
+
+Every other baseline reads rows. Parquet does not - it is columnar,
+per-column coded and dictionary encoded, which is the same design this
+tool uses. So it is the only comparison that tests the idea rather
+than the effort.
+
+| | bytes | time | returns the original file |
+| --- | --- | --- | --- |
+| parquet text + brotli | 110,022 | 0.12s | yes |
+| parquet text + gzip | 111,919 | 0.09s | yes |
+| parquet text + zstd | 113,382 | 0.09s | yes |
+| parquet text + snappy | 133,993 | 0.09s | yes |
+| **xola-tabular** | **84,932** | 1.48s | **yes** |
+| parquet TYPED | — | — | no, and it would not load |
+
+**22.8% ahead, at more than ten times the time.**
+
+**And the typed comparison could not be run.** Arrow infers a type per
+column per file. On a thousand real EPA files that produced a thousand
+schemas that will not merge:
+
+    ArrowTypeError: Field Qualifier has incompatible types:
+                    int64 vs string
+
+Qualifier is empty in most files and holds text in a few. The empty
+ones infer as int64.
+
+That is worth stating carefully, because it is easy to overclaim. It
+is not a defect in Parquet - a format that stores typed values must
+decide the types, and real CSV archives written over years do not
+agree with themselves. It IS a real operational cost, it appeared on
+the first archive tried, and reading everything as text is the
+workaround, which is what the table above does.
+
+**One more thing the number does not say.** Parquet returns the DATA.
+This returns the FILE. 6.70 and 6.7 are the same float and a different
+seven bytes. Whether that distinction is worth 22% depends entirely on
+whether the archive exists to be queried or to be returned - and that
+is a question for the customer, not the benchmark.
+
+## A third coder
+
+Parquet with brotli beat Parquet with zstd and gzip on this archive.
+A coder that wins inside Parquet on this data is worth offering here,
+so brotli joins bzip2 and zstd as a candidate, chosen per group by the
+same sampled comparison as the others.
+
+Optional, like zstd. Without it the tool behaves as before - verified
+byte-identical output on three corpora with neither installed.
+
+### And what brotli's quality setting is worth
+
+Offering brotli meant choosing a quality, and the obvious choice was
+wrong. Measured on the whole archive, two runs each, minimum taken:
+
+| brotli | bytes | vs off | time | vs off |
+| --- | --- | --- | --- | --- |
+| off | 85,186 | — | 1.18s | — |
+| quality 5 | 87,110 | **-2.26%** | 1.19s | +1% |
+| quality 7 | 85,378 | -0.23% | 1.16s | -2% |
+| **quality 9** | **84,932** | **+0.30%** | **1.16s** | **-2%** |
+| quality 11 | 84,549 | +0.75% | 2.69s | **+128%** |
+
+Quality 11 was the first thing tried and it cost 128% of the time for
+0.75%. Quality 9 gives most of the gain for nothing measurable.
+
+And quality 5 is WORSE than not offering brotli at all - below a
+certain effort it loses to bzip2 on these columns, and the sample
+picks it anyway because the sample is small enough that the difference
+has not appeared yet.
+
+`BROTLI_Q` at the top of groupcol.py is the setting. Zero turns it off.

@@ -4,15 +4,18 @@
 
 ## HIGHLIGHTS
 
-> **Four times smaller.** 341,310 bytes to 85,186 on 1,000 real files.
+> **Four times smaller.** 341,310 bytes to 84,932 on 1,000 real files.
+>
+> **22.8% smaller than Parquet** - the format every data lake uses,
+> which is columnar and per-column coded exactly as this is.
 >
 > **71.9% smaller than the best of seven baselines** - including
 > xz -9e, zstd -22, and zstd with a 2 GB window.
 >
-> **Faster than four of those seven.** 1.22s where xz -9e takes 12.80s.
+> **Faster than four of those seven.** 1.48s where xz -9e takes 12.80s.
 >
 > **2.8x faster than the low point during the work** - 6.3 MB/s at the
-> worst moment today, 17.5 MB/s now.
+> worst moment today, 14.4 MB/s now.
 >
 > **Every file byte for byte identical**, verified by decoding the
 > whole archive and comparing.
@@ -34,9 +37,55 @@ On 1,000 real EPA air quality files - 21.3 MB:
 | | bytes | saved |
 | --- | --- | --- |
 | **this morning** | **341,310** | 98.40% |
-| **tonight** | **85,186** | **99.60%** |
+| **tonight** | **84,932** | **99.60%** |
 
 **Four times smaller.**
+
+## Against Parquet, which is the comparison that counts
+
+The seven baselines below all read ROWS. That is why they lose - a CSV
+stores rows and the redundancy lives in columns.
+
+Parquet does not have that problem. It is columnar by design, codes
+each column separately, dictionary-encodes strings. Everything this
+tool does, from a format every data lake already uses.
+
+Same 1,000 files, every column read as text so both sides carry the
+same information:
+
+| | bytes | time |
+| --- | --- | --- |
+| parquet + snappy | 133,993 | 0.09s |
+| parquet + zstd | 113,382 | 0.09s |
+| parquet + gzip | 111,919 | 0.09s |
+| **parquet + brotli** | **110,022** | 0.12s |
+| **xola-tabular** | **84,932** | 1.48s |
+
+**22.8% smaller than the best Parquet.**
+
+Two things belong next to that, and they matter more than the number.
+
+**Parquet is ten times faster.** Most buyers will take that trade, and
+they would be right to.
+
+**And Parquet returns the DATA. This returns the FILE.** 6.70 and 6.7
+are the same float and a different seven bytes. Whether that is worth
+22.8% depends entirely on whether the archive exists to be queried or
+to be returned - and that is a question for a customer, not a
+benchmark.
+
+One more thing worth knowing: **Parquet's typed mode could not read
+this archive at all.**
+
+    ArrowTypeError: Field Qualifier has incompatible types:
+                    int64 vs string
+
+One column is empty in most of the thousand files and holds text in a
+few, so a thousand schemas would not merge. Not a defect in Parquet -
+it is what happens when a format storing typed values meets a decade
+of CSVs written by software that did not agree with itself. But it is
+an operational cost the columnar pitch does not mention, and it
+appeared on the first real archive tried.
 
 ## Against every tool anyone would name
 
@@ -51,7 +100,7 @@ Same archive, same machine, same run:
 | tar + zstd -19 | 468,931 | 6.77s |
 | tar + zstd -22 | 402,909 | 17.70s |
 | tar + zstd -19 --long=31 | 469,260 | 7.06s |
-| **xola-tabular** | **85,186** | **1.22s** |
+| **xola-tabular** | **84,932** | **1.48s** |
 
 **71.9% smaller than the best of them, and faster than four of the
 seven.**
@@ -68,9 +117,9 @@ rather than code:
 | --- | --- | --- | --- | --- |
 | this morning | 341,310 | 1.70s | 12.5 MB/s | pack + verify |
 | after coder choice | 85,166 | 3.38s | 6.3 MB/s | pack + verify |
-| after sampled decision | 85,186 | 2.77s | 7.7 MB/s | pack + verify |
-| after hot path fixes | 85,186 | 2.47s | 8.6 MB/s | pack + verify |
-| **tonight** | **85,186** | **1.22s** | **17.5 MB/s** | **pack only** |
+| after sampled decision | 84,932 | 2.77s | 7.7 MB/s | pack + verify |
+| after hot path fixes | 84,932 | 2.47s | 8.6 MB/s | pack + verify |
+| **tonight** | **84,932** | **1.48s** | **14.4 MB/s** | **pack only** |
 
 Two things to read carefully.
 
@@ -88,7 +137,7 @@ larger, and quick about it.
 Like for like, both including verification: **1.70s this morning,
 2.60s tonight.** Four times smaller for half a second more.
 
-    pack        1.22s     17.5 MB/s
+    pack        1.48s     14.4 MB/s
     verify      2.60s     the full round trip
     read back   0.60s     35.4 MB/s
 
@@ -107,6 +156,12 @@ bundle that wins.
 **Delta encoding.** Columns of numbers stored as differences between
 consecutive values. Worth 38.8% on instrument data where numeric
 columns dominate the archive. Costs nothing where it does not apply.
+
+**A third coder.** Parquet with brotli beat Parquet with zstd and
+gzip on this archive, so brotli joins bzip2 and zstd as a candidate.
+At quality 9 it is worth 254 bytes for no measurable time. Quality 11
+was tried first and cost 128% of the runtime for 0.75% - now measured
+rather than argued.
 
 **Two hot paths.** Character transposition was building one generator
 per character position; a flat join and stepped slices moved that loop
@@ -174,7 +229,7 @@ down so nobody repeats them. Someone joining does not need the history
 
     IF the Rust port happens first
 
-The port is the condition. In pure Python at 17.5 MB/s this is an
+The port is the condition. In pure Python at 14.4 MB/s this is an
 archival tool; real pipelines compress at hundreds of megabytes a
 second. Four to eight weeks of work, and it should follow a reason - a
 user, an inquiry, someone saying 1.2 seconds is too slow - rather than

@@ -297,6 +297,44 @@ def _zstd():
     except ImportError:
         return None
 
+# BROTLI'S QUALITY SETTING, AND WHY IT IS NOT 11.
+#
+# At quality 11 brotli found 637 more bytes on a 1,000-file EPA
+# archive - 0.7% - and took the pack from 1.22 seconds to 3.13. Two
+# and a half times the time for seven tenths of a percent is a bad
+# trade, and the sample is paid on every group whether brotli wins or
+# not.
+#
+# This constant exists so the trade can be measured rather than
+# argued. Set it to 0 to turn brotli off entirely.
+BROTLI_Q = 9
+
+
+def _brotli():
+    """brotli if it is installed, otherwise None.
+
+    WHY IT IS OFFERED AT ALL.
+    -------------------------
+    Parquet was measured on the same 1,000-file EPA archive with four
+    codecs, and brotli won:
+
+        snappy   133,993
+        zstd     113,382
+        gzip     111,919
+        brotli   110,022
+
+    A coder that beats zstd inside Parquet on this data is worth
+    offering here too. Whether it wins is measured per group, like
+    everything else - it is a candidate, not a decision.
+
+    Optional, like zstd. Without it the tool behaves as it did before.
+    """
+    try:
+        import brotli
+        return brotli
+    except ImportError:
+        return None
+
 
 def _best_coder(data, sample=262144):
     """The smaller of bzip2 and zstd, decided from a sample.
@@ -320,24 +358,43 @@ def _best_coder(data, sample=262144):
     frames have a fixed magic number too, and relying on two different
     sniffs in one format is asking for a silent mismatch."""
     z = _zstd()
-    if z is None:
+    br = _brotli() if BROTLI_Q else None
+    if z is None and br is None:
         return b"B" + bz2.compress(data, 9)
+
+    def make(tag, blob):
+        return tag + blob
+
+    def try_all(d):
+        """Every coder that is installed, as (tag, bytes)."""
+        out = [(b"B", bz2.compress(d, 9))]
+        if z is not None:
+            try:
+                out.append((b"Z", z.ZstdCompressor(level=19).compress(d)))
+            except Exception:
+                pass
+        if br is not None:
+            try:
+                out.append((b"R", br.compress(d, quality=BROTLI_Q)))
+            except Exception:
+                pass
+        return out
+
     if len(data) <= sample:
-        b = bz2.compress(data, 9)
-        try:
-            c = z.ZstdCompressor(level=19).compress(data)
-        except Exception:
-            return b"B" + b
-        return (b"Z" + c) if len(c) < len(b) else (b"B" + b)
+        tag, blob = min(try_all(data), key=lambda x: len(x[1]))
+        return make(tag, blob)
+
+    # decide on a sample, apply to the whole group
     probe = data[:sample]
-    try:
-        use_zstd = (len(z.ZstdCompressor(level=19).compress(probe))
-                    < len(bz2.compress(probe, 9)))
-    except Exception:
-        use_zstd = False
-    if use_zstd:
+    tag = min(try_all(probe), key=lambda x: len(x[1]))[0]
+    if tag == b"Z" and z is not None:
         try:
             return b"Z" + z.ZstdCompressor(level=19).compress(data)
+        except Exception:
+            pass
+    elif tag == b"R" and br is not None:
+        try:
+            return b"R" + br.compress(data, quality=BROTLI_Q)
         except Exception:
             pass
     return b"B" + bz2.compress(data, 9)
@@ -353,6 +410,12 @@ def _read_coder(blob):
             raise ValueError(
                 "this bundle used zstd - install it:  pip install zstandard")
         return z.ZstdDecompressor().decompress(body)
+    if tag == b"R":
+        br = _brotli()
+        if br is None:
+            raise ValueError(
+                "this bundle used brotli - install it:  pip install brotli")
+        return br.decompress(body)
     raise ValueError("bundle is corrupt: unknown coder tag")
 
 
@@ -723,8 +786,6 @@ def _col_encode(vals):
     # the features that suggest it - a common width, few repeats - do
     # not separate cleanly enough to trust. One comparison, and only
     # when the width test has already passed.
-    if len(cands) == 1:
-        return cands[0]
     # DIFFERENCES, OFFERED AS ONE MORE CANDIDATE.
     #
     # Not a transform applied first and hoped for - just another way
@@ -732,9 +793,26 @@ def _col_encode(vals):
     # rule that already picks between them. On sensor data it wins by
     # a quarter; on data where each row is unrelated to the last it
     # loses, and loses openly.
+    #
+    # THIS USED TO SIT AFTER AN EARLY RETURN AND WAS OFTEN SKIPPED.
+    #
+    # The line below was `if len(cands) == 1: return cands[0]`, placed
+    # BEFORE this block. A column that did not qualify for
+    # transposition therefore had one candidate, returned immediately,
+    # and never saw the delta offer at all.
+    #
+    # Measured on a sensor column that hit exactly that path:
+    #
+    #     plain    36,068 bytes   <- what it chose
+    #     delta    28,874 bytes   <- what it never looked at
+    #
+    # Twenty percent, on the columns most likely to benefit, lost to
+    # the order of two blocks of code.
     dl = _delta_encode(vals)
     if dl is not None:
         cands.append((COL_DELTA, dl))
+    if len(cands) == 1:
+        return cands[0]
     return min(cands, key=lambda mc: len(bz2.compress(mc[1], 1)))
 
 
